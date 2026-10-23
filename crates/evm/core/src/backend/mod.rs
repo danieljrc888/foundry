@@ -26,7 +26,10 @@ use itertools::Itertools;
 use revm::{
     Database, DatabaseCommit, JournalEntry,
     bytecode::Bytecode,
-    context::{Block, BlockEnv, CfgEnv, ContextTr, JournalInner, Transaction},
+    context::{
+        Block, BlockEnv, CfgEnv, ContextTr, JournalInner, Transaction,
+        result::{ExecutionResult, HaltReason},
+    },
     context_interface::{journaled_state::account::JournaledAccountTr, result::ResultAndState},
     database::{CacheDB, DatabaseRef, EmptyDB},
     primitives::{AddressMap, HashMap as Map, KECCAK_EMPTY, Log},
@@ -959,10 +962,77 @@ impl<FEN: FoundryEvmNetwork> Backend<FEN> {
             let replay_db = fork.db.clone();
             let mut evm = FEN::EvmFactory::default().create_evm(replay_db, evm_env);
 
+            let mut reverted_count = 0usize;
+            let mut halted_count = 0usize;
             for tx in &txs_to_replay {
                 let tx_env = TxEnvFor::<FEN>::from_any_rpc_transaction(tx)?;
                 trace!(tx=?tx.tx_hash(), "committing transaction");
-                evm.transact_commit(tx_env).wrap_err("backend: failed committing transaction")?;
+                let result = evm
+                    .transact_commit(tx_env)
+                    .wrap_err("backend: failed committing transaction")?;
+                // Inspect the ExecutionResult: only Success commits state changes; Revert/Halt
+                // silently drop them while still consuming the sender's nonce + gas. Without
+                // surfacing this, fork state can silently diverge from mainnet, causing
+                // confusing downstream test failures (eg "InvalidAmount" from a contract that
+                // would have held a position if the setup tx had actually applied).
+                match &result {
+                    ExecutionResult::Success { .. } => {}
+                    ExecutionResult::Revert { output, .. } => {
+                        reverted_count += 1;
+                        // Decode the revert output. Standard Error(string) is the most common form:
+                        //   selector 0x08c379a0 + abi-encoded string. We extract the string for the
+                        //   user. For non-string custom errors we show the first 4 bytes (selector).
+                        let reason: String = if output.len() >= 4 + 32 + 32
+                            && &output[..4] == [0x08, 0xc3, 0x79, 0xa0]
+                        {
+                            // skip selector(4) + offset(32), read length, then bytes
+                            let str_len_pos = 4 + 32;
+                            let str_data_pos = 4 + 32 + 32;
+                            let len = u32::from_be_bytes([
+                                output[str_len_pos + 28],
+                                output[str_len_pos + 29],
+                                output[str_len_pos + 30],
+                                output[str_len_pos + 31],
+                            ]) as usize;
+                            if str_data_pos + len <= output.len() {
+                                String::from_utf8_lossy(&output[str_data_pos..str_data_pos + len])
+                                    .into_owned()
+                            } else {
+                                format!("<malformed Error(string), {} bytes>", output.len())
+                            }
+                        } else if output.len() >= 4 {
+                            format!(
+                                "<custom error selector 0x{:02x}{:02x}{:02x}{:02x}, {} bytes>",
+                                output[0], output[1], output[2], output[3], output.len(),
+                            )
+                        } else {
+                            format!("<empty revert, {} bytes>", output.len())
+                        };
+                        warn!(
+                            tx=?tx.tx_hash(),
+                            reason=%reason,
+                            "replay_until: prior in-block tx REVERTED — state changes discarded"
+                        );
+                    }
+                    ExecutionResult::Halt { reason, .. } => {
+                        halted_count += 1;
+                        warn!(
+                            tx=?tx.tx_hash(),
+                            ?reason,
+                            "replay_until: prior in-block tx HALTED — state changes discarded"
+                        );
+                    }
+                }
+            }
+            if reverted_count > 0 || halted_count > 0 {
+                warn!(
+                    reverted = reverted_count,
+                    halted   = halted_count,
+                    total    = txs_to_replay.len(),
+                    "replay_until: some prior in-block txs did not apply; fork state may diverge from mainnet. Enable RUST_LOG=foundry_evm_core=warn to see each tx hash."
+                );
+                // Touch the type to silence dead_code analysis when revm's HaltReason becomes opaque.
+                let _: Option<HaltReason> = None;
             }
 
             // Extract the DB back and replace the fork's database with the replayed state.
